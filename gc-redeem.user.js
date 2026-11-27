@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gift Card Redeemer (giftcards.com)
 // @namespace    gc-redeemer
-// @version      1.6.2
+// @version      1.7.0
 // @description  Redeem ALL giftcards.com "Redeem now" links from your Gmail and auto-fill the Visa registration form. You solve the CAPTCHA manually, then collect card numbers into a TSV download.
 // @match        *://mail.google.com/*
 // @match        *://*.giftcards.com/*
@@ -493,7 +493,91 @@
     await sleep(500);
   }
 
-  /* ---------------- Gmail: open every redeem link ---------------- */
+  /* ---------------- Gmail: open redeem links (single & batch) ---------------- */
+
+  function isGiftcardsRedeemUrl(href) {
+    try {
+      const u = new URL(href);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+      if (isHostInDomain(u.hostname, 'giftcards.com')) return true;
+      // Giftcards.com emails wrap links via AWS SES click tracking (*.awstrack.me/L0/<encoded-url>/...).
+      if (isHostInDomain(u.hostname, 'awstrack.me')) {
+        const m = u.pathname.match(/^\/L\d+\/([^/]+)/i);
+        if (m) {
+          try {
+            const inner = new URL(decodeURIComponent(m[1]));
+            return isHostInDomain(inner.hostname, 'giftcards.com');
+          } catch (e2) {}
+        }
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Classify the card type from the Gmail message body containing this anchor.
+  // Strips the boilerplate "Gifted a One4all Gift Card?" footer so VGC emails
+  // are not misclassified as One4all.
+  function detectEmailCardType(anchor) {
+    let container = anchor.closest ? anchor.closest('.a3s') : null;
+    if (!container) {
+      container = anchor;
+      for (let i = 0; i < 10 && container.parentElement; i++) {
+        container = container.parentElement;
+      }
+    }
+    let text = (container && (container.innerText || container.textContent)) || '';
+    const footerIdx = text.search(/Gifted\s+a\s+One4all\s+Gift\s+Card/i);
+    if (footerIdx !== -1) text = text.slice(0, footerIdx);
+    if (/visa[\s®™]*virtual/i.test(text) || /virtual[\s]*visa/i.test(text)) return 'vgc';
+    if (/mastercard[\s®™]*virtual/i.test(text) || /virtual[\s]*mastercard/i.test(text)) return 'mgc';
+    return 'other';
+  }
+
+  function matchesCardFilter(cardType, filterMode) {
+    if (filterMode === 'all') return true;
+    if (filterMode === 'virtual') return cardType === 'vgc' || cardType === 'mgc';
+    return cardType === 'vgc';
+  }
+
+  function getCollectedOrders() {
+    const s = new Set();
+    for (const r of getCardRows()) {
+      if (r.order) s.add(String(r.order).trim());
+    }
+    return s;
+  }
+
+  async function collectGmailRedeemItems() {
+    await expandGmail();
+    const links = [...document.querySelectorAll('a')].filter((a) =>
+      a.textContent.trim() === 'Redeem now' && isGiftcardsRedeemUrl(a.href)
+    );
+    const items = [];
+    const seen = new Set();
+    for (const a of links) {
+      if (seen.has(a.href)) continue;
+      seen.add(a.href);
+      items.push({
+        href: a.href,
+        order: findOrderNumber(a),
+        cardType: detectEmailCardType(a),
+      });
+    }
+    return items;
+  }
+
+  function openRedeemItem(href, order) {
+    const lid = lineItemIdFromUrl(href);
+    if (lid && order) {
+      try { GM_setValue('gc_order_' + lid, order); } catch (e) {}
+      debug('mapped', lid, '-> order', order);
+    } else if (order && !lid) {
+      debug('order found but no lineItemId in href, cannot map:', href.slice(0, 120));
+    }
+    GM_openInTab(href, { active: false, insert: true, setParent: true });
+  }
 
   async function startRedeem() {
     allowLogBox();
@@ -508,41 +592,7 @@
       return;
     }
 
-    // Expand trimmed/hidden email content so all links are in the DOM.
-    await expandGmail();
-
-    const isGiftcardsRedeemUrl = (href) => {
-      try {
-        const u = new URL(href);
-        if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
-        if (isHostInDomain(u.hostname, 'giftcards.com')) return true;
-        // Giftcards.com emails wrap links via AWS SES click tracking (*.awstrack.me/L0/<encoded-url>/...).
-        if (isHostInDomain(u.hostname, 'awstrack.me')) {
-          const m = u.pathname.match(/^\/L\d+\/([^/]+)/i);
-          if (m) {
-            try {
-              const inner = new URL(decodeURIComponent(m[1]));
-              return isHostInDomain(inner.hostname, 'giftcards.com');
-            } catch (e2) {}
-          }
-        }
-        return false;
-      } catch (e) {
-        return false;
-      }
-    };
-
-    const links = [...document.querySelectorAll('a')].filter((a) =>
-      a.textContent.trim() === 'Redeem now' && isGiftcardsRedeemUrl(a.href)
-    );
-    // Dedupe by href, keeping the order number found near each button.
-    const items = [];
-    const seen = new Set();
-    for (const a of links) {
-      if (seen.has(a.href)) continue;
-      seen.add(a.href);
-      items.push({ href: a.href, order: findOrderNumber(a) });
-    }
+    const items = await collectGmailRedeemItems();
     log('found', items.length, '"Redeem now" link(s)');
     if (!items.length) {
       toast('No "Redeem now" links found on this page.');
@@ -557,18 +607,224 @@
     log(`opening ${items.length} link(s), one every ${delaySec}s`);
     toast(`Opening ${items.length} gift card link(s)…`);
     for (const { href, order } of items) {
-      const lid = lineItemIdFromUrl(href);
-      if (lid && order) {
-        try { GM_setValue('gc_order_' + lid, order); } catch (e) {}
-        debug('mapped', lid, '-> order', order);
-      } else if (order && !lid) {
-        debug('order found but no lineItemId in href, cannot map:', href.slice(0, 120));
-      }
-      GM_openInTab(href, { active: false, insert: true, setParent: true });
+      openRedeemItem(href, order);
       await sleep(delaySec * 1000);
     }
     log(`done — opened ${items.length} link(s); solve the CAPTCHA in each tab`);
     setTimeout(hideLogBox, 4000);
+  }
+
+  let __batchRunning = false;
+  let __batchStopRequested = false;
+
+  async function sleepInterruptible(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end && !__batchStopRequested) {
+      await sleep(Math.min(250, end - Date.now()));
+    }
+  }
+
+  function showBatchStopButton() {
+    let btn = document.getElementById('gc-batch-stop');
+    if (btn) return btn;
+    btn = mkEl('button', 'Stop batch',
+      'position:fixed;left:12px;bottom:260px;z-index:2147483647;' +
+      'padding:8px 14px;border:0;background:#d93025;color:#fff;border-radius:8px;' +
+      'font:600 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.35);');
+    btn.id = 'gc-batch-stop';
+    btn.onclick = () => {
+      __batchStopRequested = true;
+      btn.textContent = 'Stopping…';
+      btn.disabled = true;
+      log('stop requested by user');
+    };
+    (document.body || document.documentElement).appendChild(btn);
+    return btn;
+  }
+
+  function hideBatchStopButton() {
+    const btn = document.getElementById('gc-batch-stop');
+    if (btn) btn.remove();
+  }
+
+  async function goToNextGmailEmail() {
+    const olderSel = [
+      '[aria-label="Older"]', '[aria-label="较旧"]', '[aria-label="較舊"]',
+      '[data-tooltip="Older"]', '[data-tooltip="较旧"]', '[data-tooltip="較舊"]',
+    ].join(', ');
+    const btns = [...document.querySelectorAll(olderSel)].filter((b) => b.offsetParent !== null);
+    const btn = btns.find((b) => b.getAttribute('aria-disabled') !== 'true' && !b.disabled);
+    if (!btn) return false;
+    const prevUrl = location.href;
+    btn.click();
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && !__batchStopRequested) {
+      if (location.href !== prevUrl) break;
+      await sleep(200);
+    }
+    if (location.href === prevUrl) return false;
+    // Wait for the new email body to render.
+    const bodyDeadline = Date.now() + 6000;
+    while (Date.now() < bodyDeadline && !__batchStopRequested) {
+      if ([...document.querySelectorAll('.a3s')].some((el) => el.offsetParent !== null)) break;
+      await sleep(200);
+    }
+    await sleepInterruptible(800);
+    return true;
+  }
+
+  async function runBatchRedeem({ maxEmails, filterMode, skipCollected }) {
+    if (__batchRunning) {
+      toast('Batch redeem is already running.');
+      return;
+    }
+    const profile = GM_getValue(PROFILE_KEY, null);
+    if (!profile || !profile.email) {
+      toast('Open GC: Settings from the Tampermonkey menu first.');
+      openProfilePanel();
+      return;
+    }
+
+    __batchRunning = true;
+    __batchStopRequested = false;
+    allowLogBox();
+    showBatchStopButton();
+
+    const iv = parseFloat(profile.openInterval);
+    const delaySec = isFinite(iv) && iv > 0 ? iv : 5;
+    const collectedOrders = getCollectedOrders();
+
+    let scanned = 0;
+    let opened = 0;
+    let skippedFilter = 0;
+    let skippedCollected = 0;
+    let skippedEmpty = 0;
+
+    try {
+      log(`batch start: up to ${maxEmails} email(s), filter=${filterMode}, skipCollected=${skipCollected}`);
+      for (let i = 1; i <= maxEmails; i++) {
+        if (__batchStopRequested) break;
+        scanned++;
+        const items = await collectGmailRedeemItems();
+        if (!items.length) {
+          skippedEmpty++;
+          log(`[${i}/${maxEmails}] no giftcards.com "Redeem now" link — skipped`);
+        } else {
+          for (const item of items) {
+            if (__batchStopRequested) break;
+            if (!matchesCardFilter(item.cardType, filterMode)) {
+              skippedFilter++;
+              log(`[${i}/${maxEmails}] skipped [${item.cardType}]${item.order ? ' order ' + item.order : ''}`);
+              continue;
+            }
+            if (skipCollected && item.order && collectedOrders.has(item.order)) {
+              skippedCollected++;
+              log(`[${i}/${maxEmails}] skipped already-collected order ${item.order}`);
+              continue;
+            }
+            openRedeemItem(item.href, item.order);
+            opened++;
+            if (item.order) collectedOrders.add(item.order);
+            log(`[${i}/${maxEmails}] opened [${item.cardType}]${item.order ? ' order ' + item.order : ''} (#${opened})`);
+            await sleepInterruptible(delaySec * 1000);
+          }
+        }
+
+        if (i < maxEmails && !__batchStopRequested) {
+          const moved = await goToNextGmailEmail();
+          if (!moved) {
+            log('reached last email (no "Older" button available)');
+            break;
+          }
+        }
+      }
+      const status = __batchStopRequested ? 'stopped' : 'done';
+      const summary = `batch ${status}: scanned ${scanned}, opened ${opened}, skipped (filter:${skippedFilter}, collected:${skippedCollected}, empty:${skippedEmpty})`;
+      log(summary);
+      toast(`Batch ${status}: opened ${opened} card link(s) from ${scanned} email(s).`, 8000);
+    } finally {
+      __batchRunning = false;
+      __batchStopRequested = false;
+      hideBatchStopButton();
+    }
+  }
+
+  function openBatchRedeemPanel() {
+    allowLogBox();
+    if (!isHostInDomain(location.hostname, 'mail.google.com')) {
+      toast('Open a Gmail email first, then run Batch redeem.');
+      return;
+    }
+    if (__batchRunning) {
+      toast('Batch redeem is already running.');
+      return;
+    }
+    const profile = GM_getValue(PROFILE_KEY, null);
+    if (!profile || !profile.email) {
+      toast('Open GC: Settings from the Tampermonkey menu first.');
+      openProfilePanel();
+      return;
+    }
+    if (document.getElementById('gc-batch-panel')) return;
+
+    const panel = mkEl('div', null,
+      'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:2147483647;' +
+      'background:#fff;color:#111;border-radius:12px;padding:24px;width:360px;' +
+      'box-shadow:0 8px 40px rgba(0,0,0,.4);font:14px system-ui,sans-serif;');
+    panel.id = 'gc-batch-panel';
+    panel.appendChild(mkEl('h3', 'Batch redeem across emails', 'margin:0 0 12px;font-size:16px;'));
+
+    const countLab = mkEl('label', 'Emails to scan (uses Gmail ">" Older button):', 'display:block;margin-bottom:10px;');
+    const countInp = mkEl('input', null,
+      'width:100%;box-sizing:border-box;padding:6px 8px;margin-top:4px;border:1px solid #ccc;border-radius:6px;color:#111;background:#fff;');
+    countInp.type = 'number';
+    countInp.min = '1';
+    countInp.max = '200';
+    countInp.value = '10';
+    countLab.appendChild(countInp);
+    panel.appendChild(countLab);
+
+    const filterLab = mkEl('label', 'Card type filter:', 'display:block;margin-bottom:10px;');
+    const filterSel = mkEl('select', null,
+      'width:100%;box-sizing:border-box;padding:6px 8px;margin-top:4px;border:1px solid #ccc;border-radius:6px;color:#111;background:#fff;');
+    [
+      ['vgc', 'Visa Virtual Gift Card only (VGC)'],
+      ['virtual', 'Visa + Mastercard Virtual (VGC / MGC)'],
+      ['all', 'All giftcards.com "Redeem now" links'],
+    ].forEach(([val, text]) => {
+      const opt = mkEl('option', text);
+      opt.value = val;
+      filterSel.appendChild(opt);
+    });
+    filterLab.appendChild(filterSel);
+    panel.appendChild(filterLab);
+
+    const skipLab = mkEl('label', null, 'display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer;');
+    const skipChk = mkEl('input', null,
+      'appearance:auto;-webkit-appearance:checkbox;width:16px;height:16px;margin:0;flex:none;accent-color:#1a73e8;cursor:pointer;');
+    skipChk.type = 'checkbox';
+    skipChk.checked = true;
+    skipLab.appendChild(skipChk);
+    skipLab.appendChild(document.createTextNode('Skip already-collected Order Numbers'));
+    panel.appendChild(skipLab);
+
+    const row = mkEl('div', null, 'display:flex;justify-content:flex-end;gap:8px;');
+    const cancel = mkEl('button', 'Cancel',
+      'padding:8px 14px;border:1px solid #ccc;background:#f5f5f5;border-radius:6px;cursor:pointer;');
+    const start = mkEl('button', 'Start',
+      'padding:8px 14px;border:0;background:#1a73e8;color:#fff;border-radius:6px;cursor:pointer;');
+    cancel.onclick = () => panel.remove();
+    start.onclick = () => {
+      const n = Math.max(1, Math.min(200, parseInt(countInp.value, 10) || 10));
+      const filterMode = filterSel.value;
+      const skipCollected = !!skipChk.checked;
+      panel.remove();
+      runBatchRedeem({ maxEmails: n, filterMode, skipCollected });
+    };
+    row.appendChild(cancel);
+    row.appendChild(start);
+    panel.appendChild(row);
+    (document.body || document.documentElement).appendChild(panel);
   }
 
   /* ---------------- giftcards.com: email -> verify -> claim ---------------- */
@@ -1141,6 +1397,7 @@
 
   GM_registerMenuCommand('GC: Settings', openProfilePanel);
   GM_registerMenuCommand('GC: Redeem all gift cards', startRedeem);
+  GM_registerMenuCommand('GC: Batch redeem emails', openBatchRedeemPanel);
   GM_registerMenuCommand('GC: View collected cards', openCardsPanel);
   GM_registerMenuCommand('GC: Download card data (TSV)', downloadCards);
   GM_registerMenuCommand('GC: Clear collected card data', clearCards);
