@@ -12,7 +12,7 @@ and collects the issued card numbers into a TSV file.
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/).
 2. Chrome/Edge: turn on "Allow User Scripts" — see Install below.
-3. **[Install the script (latest release)](https://github.com/bviypz/gc-redeem/releases/latest/download/gc-redeem.user.js)** → click **Install** in the Tampermonkey tab.
+3. **[Install the script (latest release)](https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.user.js)** → click **Install** in the Tampermonkey tab.
 4. Open your Gmail message with the "Redeem now" links → Tampermonkey menu →
    **GC: Settings**, fill in your profile once.
 5. Tampermonkey menu → **GC: Redeem all gift cards**. Each link opens and the
@@ -65,7 +65,7 @@ giftcards.com tab closes itself once the order number has been handed off
    > Google. It may be unsafe and you should only enable this if you know
    > what you are doing.
 3. Click this install link (always the latest release):
-   [gc-redeem.user.js](https://github.com/bviypz/gc-redeem/releases/latest/download/gc-redeem.user.js)
+   [gc-redeem.user.js](https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.user.js)
 4. Tampermonkey opens an install tab — click **Install**.
 5. Open your Gmail message with the redeem links, then open the Tampermonkey
    menu (puzzle-piece icon → Tampermonkey) and choose **GC: Settings** to fill

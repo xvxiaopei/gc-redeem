@@ -11,7 +11,7 @@
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)。
 2. Chrome/Edge：开启 "Allow User Scripts" —— 见下方"安装"。
-3. **[安装脚本（最新版本）](https://github.com/bviypz/gc-redeem/releases/latest/download/gc-redeem.user.js)** → 在 Tampermonkey 安装页点击 **Install**。
+3. **[安装脚本（最新版本）](https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.user.js)** → 在 Tampermonkey 安装页点击 **Install**。
 4. 打开包含 "Redeem now" 链接的 Gmail 邮件 → Tampermonkey 菜单 →
    **GC: Settings**，填写一次个人资料。
 5. Tampermonkey 菜单 → **GC: Redeem all gift cards**。每个链接会自动打开并
@@ -62,7 +62,7 @@
    > （该扩展将可以运行未经 Google 审核的代码，可能不安全，仅在你清楚自己
    > 在做什么时开启。）
 3. 点击安装链接（永远是最新版本）：
-   [gc-redeem.user.js](https://github.com/bviypz/gc-redeem/releases/latest/download/gc-redeem.user.js)
+   [gc-redeem.user.js](https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.user.js)
 4. Tampermonkey 会打开安装页 —— 点击 **Install**。
 5. 打开包含兑换链接的 Gmail 邮件，然后打开 Tampermonkey 菜单（拼图图标 →
    Tampermonkey），选择 **GC: Settings** 填写一次注册资料。

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gift Card Redeemer (giftcards.com)
 // @namespace    gc-redeemer
-// @version      1.5.8
+// @version      1.6.0
 // @description  Redeem ALL giftcards.com "Redeem now" links from your Gmail and auto-fill the Visa registration form. You solve the CAPTCHA manually, then collect card numbers into a TSV download.
 // @match        *://mail.google.com/*
 // @match        *://*.giftcards.com/*
@@ -14,8 +14,8 @@
 // @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
 // @run-at       document-idle
-// @updateURL    https://github.com/bviypz/gc-redeem/releases/latest/download/gc-redeem.meta.js
-// @downloadURL  https://github.com/bviypz/gc-redeem/releases/latest/download/gc-redeem.user.js
+// @updateURL    https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.meta.js
+// @downloadURL  https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.user.js
 // ==/UserScript==
 
 /*
@@ -181,19 +181,20 @@
     });
   }
 
-  function xpathFirst(xp) {
-    return document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+  function isHostInDomain(hostname, domain) {
+    const h = (hostname || '').toLowerCase();
+    const d = domain.toLowerCase();
+    return h === d || h.endsWith('.' + d);
   }
 
-  function waitForXPath(xp, timeout = 15000) {
-    return new Promise((resolve) => {
-      const start = Date.now();
-      const t = setInterval(() => {
-        const el = xpathFirst(xp);
-        if (el) { clearInterval(t); resolve(el); }
-        else if (Date.now() - start > timeout) { clearInterval(t); resolve(null); }
-      }, 250);
-    });
+  function isAllowedOrigin(origin, domains) {
+    try {
+      const u = new URL(origin);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+      return domains.some((d) => isHostInDomain(u.hostname, d));
+    } catch (e) {
+      return false;
+    }
   }
 
   // Find a VISIBLE, ENABLED clickable (button/link) by its rendered text,
@@ -460,10 +461,13 @@
 
   async function expandGmail() {
     // "Expand all" is usually an icon button with aria-label (no visible text).
+    // Support English and Chinese Gmail locales.
+    const expandAllLabels = ['Expand all', '全部展开', '全部展開'];
+    const expandAllSel = expandAllLabels.map((l) => `[aria-label="${l}"]`).join(', ');
     const expandAll =
-      document.querySelector('[aria-label="Expand all"]') ||
+      document.querySelector(expandAllSel) ||
       [...document.querySelectorAll('button, div[role="button"]')]
-        .find((b) => (b.textContent || '').trim() === 'Expand all');
+        .find((b) => expandAllLabels.includes((b.textContent || '').trim()));
     if (expandAll) {
       debug('clicking "Expand all"');
       try { expandAll.scrollIntoView({ block: 'center' }); } catch (e) {}
@@ -476,8 +480,10 @@
 
     // Per-message "Show trimmed content" ("...") buttons; expanding one can
     // reveal more, so repeat until none are left (max 5 rounds).
+    const trimmedSel = ['Show trimmed content', '显示剪裁的内容', '顯示遭剪裁的內容']
+      .map((l) => `[aria-label="${l}"]`).join(', ');
     for (let round = 0; round < 5; round++) {
-      const btns = [...document.querySelectorAll('[aria-label="Show trimmed content"]')]
+      const btns = [...document.querySelectorAll(trimmedSel)]
         .filter((b) => b.offsetParent !== null);
       if (!btns.length) { debug('no trimmed sections left'); break; }
       debug(`expanding ${btns.length} trimmed section(s), round ${round + 1}`);
@@ -491,7 +497,7 @@
 
   async function startRedeem() {
     allowLogBox();
-    if (!location.hostname.includes('mail.google.com')) {
+    if (!isHostInDomain(location.hostname, 'mail.google.com')) {
       toast('Open your Gmail message with the redeem links first, then run this again.');
       return;
     }
@@ -505,8 +511,14 @@
     // Expand trimmed/hidden email content so all links are in the DOM.
     await expandGmail();
 
-    const links = [...document.querySelectorAll('a')]
-      .filter((a) => a.textContent.trim() === 'Redeem now' && a.href.includes('giftcards.com'));
+    const links = [...document.querySelectorAll('a')].filter((a) => {
+      if (a.textContent.trim() !== 'Redeem now') return false;
+      try {
+        return isHostInDomain(new URL(a.href).hostname, 'giftcards.com');
+      } catch (e) {
+        return false;
+      }
+    });
     // Dedupe by href, keeping the order number found near each button.
     const items = [];
     const seen = new Set();
@@ -588,8 +600,9 @@
       }, ms);
     };
     window.addEventListener('message', (e) => {
-      if (e.data && e.data.type === 'gc-whoami' && orderNumber) {
-        try { e.source.postMessage({ type: 'gc-order', order: orderNumber }, '*'); } catch (err) {}
+      if (!isAllowedOrigin(e.origin, ['activationspot.com', 'giftcards.com'])) return;
+      if (e.data && e.data.type === 'gc-whoami' && orderNumber && e.source) {
+        try { e.source.postMessage({ type: 'gc-order', order: orderNumber }, e.origin); } catch (err) {}
         debug('answered order request from child tab');
         scheduleClose(2000, 'order handed off to child tab');
       }
@@ -752,11 +765,23 @@
     debug('issued-card page detected, waiting for card values…');
     const numEl = await waitFor('span#cardNumber2', 25000);
     if (!numEl) { log('ERROR: span#cardNumber2 never appeared'); return; }
-    await sleep(1500); // let the values render
-    const cardNumber = numEl.innerText.trim();
-    const cvv = (document.querySelector('span#cvv2') || { innerText: '' }).innerText.trim();
-    const valid = (document.querySelector('div.alignDiv') || { innerText: '' }).innerText.trim();
-    if (!cardNumber) return;
+    // Wait for card number, CVV, and expiry to populate (up to 8s).
+    let cardNumber = '';
+    let cvv = '';
+    let valid = '';
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const curNum = document.querySelector('span#cardNumber2');
+      cardNumber = (curNum ? curNum.innerText : '').trim();
+      cvv = (document.querySelector('span#cvv2') || { innerText: '' }).innerText.trim();
+      valid = (document.querySelector('div.alignDiv') || { innerText: '' }).innerText.trim();
+      if (cardNumber && cvv && valid) break;
+      await sleep(300);
+    }
+    if (!cardNumber) { log('ERROR: card number stayed empty'); return; }
+    if (!cvv || !valid) {
+      log('WARNING: card saved with incomplete fields (cvv/valid missing); verify before closing tab');
+    }
     const { order: foundOrder, src } = await resolveCardOrder();
     if (foundOrder) debug('order resolved via ' + src + ':', foundOrder);
     else debug('no order number resolved for this card');
@@ -839,6 +864,8 @@
       };
       const to = setTimeout(() => finish(''), timeout);
       const onMsg = (e) => {
+        if (e.source !== opener) return;
+        if (!isAllowedOrigin(e.origin, ['giftcards.com', 'activationspot.com'])) return;
         if (e.data && e.data.type === 'gc-order' && e.data.order) {
           debug('  via opener:', e.data.order);
           finish(e.data.order);
@@ -952,10 +979,12 @@
   }
 
   function buildTsv(rows) {
+    const clean = (v) => String(v == null ? '' : v).replace(/[\t\r\n]+/g, ' ').trim();
     const header = 'order_number\tcard_number\tvalid_thru\tcvv\tredeemed_at\tcollected_at\tstatus';
     const lines = rows.map((r) =>
-      [r.order || '', r.cardNumber || '', r.valid || '', r.cvv || '',
-       r.redeemedAt || '', r.collectedAt || '', r.status || ''].join('\t')
+      [r.order, r.cardNumber, r.valid, r.cvv, r.redeemedAt, r.collectedAt, r.status]
+        .map(clean)
+        .join('\t')
     );
     return header + '\n' + lines.join('\n');
   }
@@ -1049,9 +1078,23 @@
 
   function clearCards() {
     allowLogBox();
-    const keys = GM_listValues().filter((k) => k.startsWith(CARD_PREFIX));
-    keys.forEach((k) => GM_deleteValue(k));
-    toast(`Cleared ${keys.length} saved card(s).`);
+    const allKeys = GM_listValues();
+    const cardKeys = allKeys.filter((k) => k.startsWith(CARD_PREFIX));
+    const metaKeys = allKeys.filter((k) =>
+      k.startsWith('gc_order_') || k.startsWith('gc_reg_') || k.startsWith('gc_regid_')
+    );
+    if (!cardKeys.length && !metaKeys.length) {
+      toast('No saved card data to clear.');
+      return;
+    }
+    if (cardKeys.length && !confirm(`Clear ${cardKeys.length} saved card(s) from Tampermonkey storage? Make sure you have exported TSV first.`)) {
+      toast('Cancelled.');
+      return;
+    }
+    cardKeys.forEach((k) => GM_deleteValue(k));
+    metaKeys.forEach((k) => GM_deleteValue(k));
+    toast(`Cleared ${cardKeys.length} saved card(s).`);
+    log(`cleared ${cardKeys.length} card(s) and ${metaKeys.length} temp mapping key(s)`);
   }
 
   /* ---------------- menu + router ---------------- */
@@ -1065,7 +1108,7 @@
   debug('gc-redeem loaded on', location.hostname, '- menu commands registered');
 
   const host = location.hostname;
-  if (host.includes('giftcards.com')) {
+  if (isHostInDomain(host, 'giftcards.com')) {
     // Only the recipient-experience page is a redeem flow
     // (/us/en/transaction/recipient-experience?lineItemId=...). Homepage,
     // shop, account and other pages are ignored.
@@ -1075,7 +1118,7 @@
     } else {
       debug('giftcards.com page is not a redeem link; plugin idle:', location.pathname);
     }
-  } else if (host.includes('activationspot.com')) {
+  } else if (isHostInDomain(host, 'activationspot.com')) {
     allowLogBox();
     routeActivationspot();
   }
