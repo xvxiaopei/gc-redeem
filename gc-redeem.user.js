@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gift Card Redeemer (giftcards.com)
 // @namespace    gc-redeemer
-// @version      1.6.0
+// @version      1.6.1
 // @description  Redeem ALL giftcards.com "Redeem now" links from your Gmail and auto-fill the Visa registration form. You solve the CAPTCHA manually, then collect card numbers into a TSV download.
 // @match        *://mail.google.com/*
 // @match        *://*.giftcards.com/*
@@ -310,7 +310,7 @@
     return h.toString(16);
   }
   function lineItemIdFromUrl(url) {
-    const m = (url || '').match(/lineItemId(?:=|%3D)([^&%#]+)/i);
+    const m = (url || '').match(/lineItemId(?:=|%3D)([^&%#/]+)/i);
     return m ? decodeURIComponent(m[1]) : '';
   }
   // Candidate storage keys for an order number, derived from a tab's own URL.
@@ -511,14 +511,30 @@
     // Expand trimmed/hidden email content so all links are in the DOM.
     await expandGmail();
 
-    const links = [...document.querySelectorAll('a')].filter((a) => {
-      if (a.textContent.trim() !== 'Redeem now') return false;
+    const isGiftcardsRedeemUrl = (href) => {
       try {
-        return isHostInDomain(new URL(a.href).hostname, 'giftcards.com');
+        const u = new URL(href);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+        if (isHostInDomain(u.hostname, 'giftcards.com')) return true;
+        // Giftcards.com emails wrap links via AWS SES click tracking (*.awstrack.me/L0/<encoded-url>/...).
+        if (isHostInDomain(u.hostname, 'awstrack.me')) {
+          const m = u.pathname.match(/^\/L\d+\/([^/]+)/i);
+          if (m) {
+            try {
+              const inner = new URL(decodeURIComponent(m[1]));
+              return isHostInDomain(inner.hostname, 'giftcards.com');
+            } catch (e2) {}
+          }
+        }
+        return false;
       } catch (e) {
         return false;
       }
-    });
+    };
+
+    const links = [...document.querySelectorAll('a')].filter((a) =>
+      a.textContent.trim() === 'Redeem now' && isGiftcardsRedeemUrl(a.href)
+    );
     // Dedupe by href, keeping the order number found near each button.
     const items = [];
     const seen = new Set();
