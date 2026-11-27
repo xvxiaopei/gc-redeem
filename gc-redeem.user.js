@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gift Card Redeemer (giftcards.com)
 // @namespace    gc-redeemer
-// @version      1.6.1
+// @version      1.6.2
 // @description  Redeem ALL giftcards.com "Redeem now" links from your Gmail and auto-fill the Visa registration form. You solve the CAPTCHA manually, then collect card numbers into a TSV download.
 // @match        *://mail.google.com/*
 // @match        *://*.giftcards.com/*
@@ -835,10 +835,25 @@
     return routeCardOrForm();
   }
 
+  function findVisibleClickableByExactText(text) {
+    const needle = text.toLowerCase().replace(/\s+/g, ' ').trim();
+    const norm = (el) => ((el.innerText || el.value || '').replace(/\s+/g, ' ').trim().toLowerCase());
+    const els = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
+    return els.find((el) => {
+      if (el.disabled) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && norm(el) === needle;
+    }) || null;
+  }
+
   // Generic: card detail page (already redeemed or just claimed) vs
   // registration form — whichever marker appears first wins.
+  // Also auto-clicks the intermediate "View my eGift" button on
+  // egift.activationspot.com and waits up to 3 minutes so manual human
+  // challenges don't cause the router to time out.
   async function routeCardOrForm() {
-    for (let i = 0; i < 60; i++) {
+    let clickedViewEgift = false;
+    for (let i = 0; i < 360; i++) {
       if (document.querySelector('span#cardNumber2')) {
         log('card detail page detected');
         return handleCardPage();
@@ -847,7 +862,16 @@
         debug('registration form detected');
         return handleRegistration();
       }
-      await sleep(250);
+      if (!clickedViewEgift) {
+        const viewBtn = findVisibleClickableByExactText('View my eGift');
+        if (viewBtn) {
+          clickedViewEgift = true;
+          log('"View my eGift" button detected, clicking…');
+          await sleep(500);
+          viewBtn.click();
+        }
+      }
+      await sleep(500);
     }
     log('WARNING: page shows neither card details nor registration form');
   }
