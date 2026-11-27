@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gift Card Redeemer (giftcards.com)
 // @namespace    gc-redeemer
-// @version      1.8.0
+// @version      1.8.1
 // @description  Redeem ALL giftcards.com "Redeem now" links from your Gmail and auto-fill the Visa registration form. You solve the CAPTCHA manually, then collect card numbers into a TSV download or auto-sync to your private Google Sheet.
 // @match        *://mail.google.com/*
 // @match        *://*.giftcards.com/*
@@ -546,12 +546,9 @@
     return cardType === 'vgc';
   }
 
-  function getCollectedOrders() {
-    const s = new Set();
-    for (const r of getCardRows()) {
-      if (r.order) s.add(String(r.order).trim());
-    }
-    return s;
+  function redeemItemKey(href) {
+    const lid = lineItemIdFromUrl(href);
+    return lid ? 'gc_opened_lid_' + lid : 'gc_opened_url_' + djb2(href || '');
   }
 
   async function collectGmailRedeemItems() {
@@ -698,7 +695,7 @@
     return hasVisibleEmailBody();
   }
 
-  async function runBatchRedeem({ maxEmails, filterMode, skipCollected }) {
+  async function runBatchRedeem({ maxEmails, filterMode, skipOpenedLinks }) {
     if (__batchRunning) {
       toast('Batch redeem is already running.');
       return;
@@ -717,12 +714,14 @@
 
     const iv = parseFloat(profile.openInterval);
     const delaySec = isFinite(iv) && iv > 0 ? iv : 5;
-    const collectedOrders = getCollectedOrders();
+    // Dedupe exact links within this batch run (never by order number, since
+    // one order can contain multiple cards sent in separate emails).
+    const seenInBatch = new Set();
 
     let scanned = 0;
     let opened = 0;
     let skippedFilter = 0;
-    let skippedCollected = 0;
+    let skippedOpened = 0;
     let skippedEmpty = 0;
 
     try {
@@ -732,7 +731,7 @@
         toast('Open a Gmail search list or email first.');
         return;
       }
-      log(`batch start: up to ${maxEmails} email(s), filter=${filterMode}, skipCollected=${skipCollected}`);
+      log(`batch start: up to ${maxEmails} email(s), filter=${filterMode}, skipOpenedLinks=${skipOpenedLinks}`);
       for (let i = 1; i <= maxEmails; i++) {
         if (__batchStopRequested) break;
         scanned++;
@@ -748,14 +747,16 @@
               log(`[${i}/${maxEmails}] skipped [${item.cardType}]${item.order ? ' order ' + item.order : ''}`);
               continue;
             }
-            if (skipCollected && item.order && collectedOrders.has(item.order)) {
-              skippedCollected++;
-              log(`[${i}/${maxEmails}] skipped already-collected order ${item.order}`);
+            const itemKey = redeemItemKey(item.href);
+            if (seenInBatch.has(itemKey) || (skipOpenedLinks && GM_getValue(itemKey, false))) {
+              skippedOpened++;
+              log(`[${i}/${maxEmails}] skipped already-opened link${item.order ? ' (order ' + item.order + ')' : ''}`);
               continue;
             }
             openRedeemItem(item.href, item.order);
+            seenInBatch.add(itemKey);
+            try { GM_setValue(itemKey, Date.now()); } catch (e) {}
             opened++;
-            if (item.order) collectedOrders.add(item.order);
             log(`[${i}/${maxEmails}] opened [${item.cardType}]${item.order ? ' order ' + item.order : ''} (#${opened})`);
             await sleepInterruptible(delaySec * 1000);
           }
@@ -770,7 +771,7 @@
         }
       }
       const status = __batchStopRequested ? 'stopped' : 'done';
-      const summary = `batch ${status}: scanned ${scanned}, opened ${opened}, skipped (filter:${skippedFilter}, collected:${skippedCollected}, empty:${skippedEmpty})`;
+      const summary = `batch ${status}: scanned ${scanned}, opened ${opened}, skipped (filter:${skippedFilter}, opened:${skippedOpened}, empty:${skippedEmpty})`;
       log(summary);
       toast(`Batch ${status}: opened ${opened} card link(s) from ${scanned} email(s).`, 8000);
     } finally {
@@ -834,9 +835,9 @@
     const skipChk = mkEl('input', null,
       'appearance:auto;-webkit-appearance:checkbox;width:16px;height:16px;margin:0;flex:none;accent-color:#1a73e8;cursor:pointer;');
     skipChk.type = 'checkbox';
-    skipChk.checked = true;
+    skipChk.checked = false;
     skipLab.appendChild(skipChk);
-    skipLab.appendChild(document.createTextNode('Skip already-collected Order Numbers'));
+    skipLab.appendChild(document.createTextNode('Skip previously opened links (by lineItemId, never by Order #)'));
     panel.appendChild(skipLab);
 
     const row = mkEl('div', null, 'display:flex;justify-content:flex-end;gap:8px;');
@@ -848,9 +849,9 @@
     start.onclick = () => {
       const n = Math.max(1, Math.min(200, parseInt(countInp.value, 10) || 10));
       const filterMode = filterSel.value;
-      const skipCollected = !!skipChk.checked;
+      const skipOpenedLinks = !!skipChk.checked;
       panel.remove();
-      runBatchRedeem({ maxEmails: n, filterMode, skipCollected });
+      runBatchRedeem({ maxEmails: n, filterMode, skipOpenedLinks });
     };
     row.appendChild(cancel);
     row.appendChild(start);
@@ -1500,7 +1501,7 @@
     const allKeys = GM_listValues();
     const cardKeys = allKeys.filter((k) => k.startsWith(CARD_PREFIX));
     const metaKeys = allKeys.filter((k) =>
-      k.startsWith('gc_order_') || k.startsWith('gc_reg_') || k.startsWith('gc_regid_')
+      k.startsWith('gc_order_') || k.startsWith('gc_reg_') || k.startsWith('gc_regid_') || k.startsWith('gc_opened_')
     );
     if (!cardKeys.length && !metaKeys.length) {
       toast('No saved card data to clear.');
