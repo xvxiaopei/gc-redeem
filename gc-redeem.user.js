@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gift Card Redeemer (giftcards.com)
 // @namespace    gc-redeemer
-// @version      1.7.0
-// @description  Redeem ALL giftcards.com "Redeem now" links from your Gmail and auto-fill the Visa registration form. You solve the CAPTCHA manually, then collect card numbers into a TSV download.
+// @version      1.8.0
+// @description  Redeem ALL giftcards.com "Redeem now" links from your Gmail and auto-fill the Visa registration form. You solve the CAPTCHA manually, then collect card numbers into a TSV download or auto-sync to your private Google Sheet.
 // @match        *://mail.google.com/*
 // @match        *://*.giftcards.com/*
 // @match        *://*.activationspot.com/*
@@ -13,6 +13,9 @@
 // @grant        GM_openInTab
 // @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
 // @run-at       document-idle
 // @updateURL    https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.meta.js
 // @downloadURL  https://github.com/xvxiaopei/gc-redeem/releases/latest/download/gc-redeem.user.js
@@ -271,6 +274,8 @@
   ];
   const SETTING_FIELDS = [
     ['openInterval', 'Delay between opening links (seconds)', 'text', '5'],
+    ['syncUrl', 'Google Sheets Sync Web App URL (optional)', 'text', ''],
+    ['syncToken', 'Google Sheets Sync Secret Token (optional)', 'text', ''],
     ['debugMode', 'Debug mode (verbose logs)', 'check', false],
   ];
   const ALL_FIELDS = [...PROFILE_FIELDS, ...SETTING_FIELDS];
@@ -673,6 +678,26 @@
     return true;
   }
 
+  function hasVisibleEmailBody() {
+    return [...document.querySelectorAll('.a3s')].some((el) => el.offsetParent !== null);
+  }
+
+  async function openFirstEmailFromListIfNeeded() {
+    if (hasVisibleEmailBody()) return true;
+    const rows = [...document.querySelectorAll('tr.zA')].filter((r) => r.offsetParent !== null);
+    if (!rows.length) return false;
+    log('Gmail list view detected — opening first email…');
+    const prevUrl = location.href;
+    rows[0].click();
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && !__batchStopRequested) {
+      if (location.href !== prevUrl && hasVisibleEmailBody()) break;
+      await sleep(200);
+    }
+    await sleepInterruptible(800);
+    return hasVisibleEmailBody();
+  }
+
   async function runBatchRedeem({ maxEmails, filterMode, skipCollected }) {
     if (__batchRunning) {
       toast('Batch redeem is already running.');
@@ -701,6 +726,12 @@
     let skippedEmpty = 0;
 
     try {
+      const ready = await openFirstEmailFromListIfNeeded();
+      if (!ready) {
+        log('ERROR: no email open and no email rows found on this Gmail page');
+        toast('Open a Gmail search list or email first.');
+        return;
+      }
       log(`batch start: up to ${maxEmails} email(s), filter=${filterMode}, skipCollected=${skipCollected}`);
       for (let i = 1; i <= maxEmails; i++) {
         if (__batchStopRequested) break;
@@ -1060,10 +1091,13 @@
     const now = new Date().toISOString();
     const key = CARD_PREFIX + cardNumber.replace(/\s+/g, '');
     const existing = GM_getValue(key, null);
+    const digits = cardNumber.replace(/\D/g, '');
+    const cardType = digits.startsWith('4') ? 'vgc' : (/^[25]/.test(digits) ? 'mgc' : 'other');
     const record = {
       cardNumber,
       valid,
       cvv,
+      cardType,
       // A re-collected card keeps its original order/redeem time; only the
       // collection time (and status) refresh. A newly seen order fills gaps.
       order: foundOrder || (existing && existing.order) || '',
@@ -1080,8 +1114,10 @@
       toast(`Card re-collected (already redeemed). Total: ${countCards()}.`, 7000);
     } else {
       log('card saved (first redeem):', masked + orderTag);
-      toast(`Card saved (${countCards()} total). Use Tampermonkey menu -> "GC: Download card data (TSV)" when done.`, 7000);
+      toast(`Card saved (${countCards()} total).`, 7000);
     }
+    // Auto-sync to private Google Sheet if configured in GC: Settings.
+    syncCardsToSheet([record], { silentIfUnconfigured: true });
   }
 
   async function routeActivationspot() {
@@ -1301,6 +1337,89 @@
     log(`exported ${rows.length} card(s) to TSV`);
   }
 
+  function isAllowedSyncUrl(url) {
+    try {
+      const u = new URL(url);
+      if (u.protocol !== 'https:') return false;
+      return isHostInDomain(u.hostname, 'script.google.com') ||
+        isHostInDomain(u.hostname, 'script.googleusercontent.com');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function syncCardsToSheet(records, { silentIfUnconfigured = false } = {}) {
+    const profile = GM_getValue(PROFILE_KEY, {});
+    const syncUrl = (profile.syncUrl || '').trim();
+    const syncToken = (profile.syncToken || '').trim();
+    if (!syncUrl || !syncToken) {
+      if (!silentIfUnconfigured) {
+        toast('Configure Sync Web App URL & Secret Token in GC: Settings first.', 7000);
+      }
+      return;
+    }
+    if (!isAllowedSyncUrl(syncUrl)) {
+      log('ERROR: syncUrl must be an https://script.google.com/... URL');
+      toast('Invalid Sync URL (must be script.google.com).', 7000);
+      return;
+    }
+    if (!records || !records.length) {
+      if (!silentIfUnconfigured) toast('No cards to sync.');
+      return;
+    }
+    const payload = {
+      token: syncToken,
+      cards: records.map((r) => ({
+        order: r.order || '',
+        cardNumber: r.cardNumber || '',
+        valid: r.valid || '',
+        cvv: r.cvv || '',
+        cardType: r.cardType || '',
+        status: r.status || '',
+        redeemedAt: r.redeemedAt || '',
+        collectedAt: r.collectedAt || '',
+      })),
+    };
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: syncUrl,
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      data: JSON.stringify(payload),
+      timeout: 20000,
+      onload: (resp) => {
+        try {
+          const j = JSON.parse(resp.responseText || '{}');
+          if (j.ok) {
+            log(`synced to Google Sheet (added: ${j.added || 0}, updated: ${j.updated || 0})`);
+            toast(`Synced to Google Sheet (+${j.added || 0} new, ${j.updated || 0} updated).`, 5000);
+          } else {
+            log('ERROR: Sheet sync rejected:', j.error || resp.status);
+            toast('Sheet sync failed: ' + (j.error || 'HTTP ' + resp.status), 7000);
+          }
+        } catch (e) {
+          log('ERROR: Sheet sync returned non-JSON (HTTP ' + resp.status + ')');
+          toast('Sheet sync failed (HTTP ' + resp.status + '). Check Web App access setting.', 7000);
+        }
+      },
+      onerror: () => {
+        log('ERROR: Sheet sync network error');
+        toast('Sheet sync network error.', 7000);
+      },
+      ontimeout: () => {
+        log('ERROR: Sheet sync timed out');
+        toast('Sheet sync timed out.', 7000);
+      },
+    });
+  }
+
+  function syncAllCardsToSheet() {
+    allowLogBox();
+    const rows = getCardRows();
+    if (!rows.length) { toast('No card data collected yet.'); return; }
+    log(`syncing ${rows.length} card(s) to Google Sheet…`);
+    syncCardsToSheet(rows, { silentIfUnconfigured: false });
+  }
+
   function copyCards() {
     allowLogBox();
     const rows = getCardRows();
@@ -1356,15 +1475,19 @@
     panel.appendChild(wrap);
 
     const btnRow = mkEl('div', null, 'margin-top:12px;display:flex;justify-content:flex-end;gap:8px;');
+    const syncBtn = mkEl('button', 'Sync to Sheet',
+      'padding:8px 14px;border:0;background:#188038;color:#fff;border-radius:6px;cursor:pointer;');
     const dl = mkEl('button', 'Download TSV',
       'padding:8px 14px;border:0;background:#1a73e8;color:#fff;border-radius:6px;cursor:pointer;');
     const cp = mkEl('button', 'Copy TSV',
       'padding:8px 14px;border:0;background:#1a73e8;color:#fff;border-radius:6px;cursor:pointer;');
     const close = mkEl('button', 'Close',
       'padding:8px 14px;border:1px solid #ccc;background:#f5f5f5;border-radius:6px;cursor:pointer;');
+    syncBtn.onclick = () => syncAllCardsToSheet();
     dl.onclick = () => downloadCards();
     cp.onclick = () => copyCards();
     close.onclick = () => panel.remove();
+    btnRow.appendChild(syncBtn);
     btnRow.appendChild(dl);
     btnRow.appendChild(cp);
     btnRow.appendChild(close);
@@ -1399,6 +1522,7 @@
   GM_registerMenuCommand('GC: Redeem all gift cards', startRedeem);
   GM_registerMenuCommand('GC: Batch redeem emails', openBatchRedeemPanel);
   GM_registerMenuCommand('GC: View collected cards', openCardsPanel);
+  GM_registerMenuCommand('GC: Sync all cards to Sheet', syncAllCardsToSheet);
   GM_registerMenuCommand('GC: Download card data (TSV)', downloadCards);
   GM_registerMenuCommand('GC: Clear collected card data', clearCards);
 
